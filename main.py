@@ -8,34 +8,38 @@ app = FastAPI(title="openrouter-proxy")
 OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 TIMEOUT = float(os.environ.get("PROXY_TIMEOUT", "90"))
 
+
 @app.get("/")
 async def health():
     return {"status": "ok", "service": "openrouter-proxy"}
 
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def proxy(request: Request, path: str):
-    # 1. Нормализуем путь: если Hermes шлет /chat/completions, 
-    # а база у нас .../api/v1, нам нужно добавить v1
-    if not path.startswith("v1/"):
-        path = f"v1/{path}"
+    # Нормализация пути: убираем "v1/" если клиент его прислал,
+    # потому что OPENROUTER_BASE уже содержит /v1
+    if path.startswith("v1/"):
+        path = path[3:]
     
     target_url = f"{OPENROUTER_BASE}/{path}"
-    
-    # 2. Собираем заголовки
-    headers = dict(request.headers)
-    headers.pop("host", None)
-    headers.pop("content-length", None)
-    
-    # 3. Если Hermes не прислал ключ, берем его из переменной окружения Render
-    if "authorization" not in [k.lower() for k in headers.keys()]:
+
+    # Собираем заголовки
+    headers = {}
+    for key, value in request.headers.items():
+        lower = key.lower()
+        if lower in ("host", "content-length"):
+            continue
+        headers[key] = value
+
+    # Если Hermes не прислал ключ, берём его из переменной окружения Render
+    has_auth = any(k.lower() == "authorization" for k in headers.keys())
+    if not has_auth:
         api_key = os.getenv("OPENROUTER_API_KEY")
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-    
-    # 4. Читаем тело запроса
+
     body = await request.body()
-    
-    # 5. Отправляем запрос в OpenRouter со стримингом
+
     async with httpx.AsyncClient(timeout=TIMEOUT) as client:
         try:
             req = client.build_request(
@@ -46,8 +50,6 @@ async def proxy(request: Request, path: str):
                 params=request.query_params,
             )
             response = await client.send(req, stream=True)
-            
-            # 6. Возвращаем потоковый ответ
             return StreamingResponse(
                 response.aiter_raw(),
                 status_code=response.status_code,
