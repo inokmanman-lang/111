@@ -1,52 +1,123 @@
-"""Мини-прокси для OpenRouter на Render.
-
-Зачем: сервер ADS-ENGINE стоит в РФ (это нужно для Ads-API), а OpenRouter
-блокирует запросы с российских IP (HTTP 403 "Access denied by security policy").
-Render разворачивает сервис на не-российском IP (США), поэтому OpenRouter его пускает.
-
-Схема:  ADS-ENGINE (РФ)  ->  этот прокси на Render (США)  ->  OpenRouter  ->  ответ обратно.
-
-Безопасность: ключ OpenRouter здесь НЕ хранится. Он приходит в заголовке Authorization
-от твоего сервера и просто пересылается дальше. Без валидного ключа прокси бесполезен.
-"""
 import os
-
 import httpx
-from fastapi import FastAPI, Request, Response
 
-OPENROUTER_BASE = os.environ.get("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
-TIMEOUT = float(os.environ.get("PROXY_TIMEOUT", "90"))
+from fastapi import FastAPI, Request
+from fastapi.responses import Response
 
-app = FastAPI(title="openrouter-proxy")
+OPENROUTER_BASE = os.getenv(
+    "OPENROUTER_BASE",
+    "https://openrouter.ai/api/v1"
+).rstrip("/")
 
-# Заголовки, которые пробрасываем в OpenRouter (в правильном регистре).
-_FORWARD = {
-    "authorization": "Authorization",
-    "http-referer": "HTTP-Referer",
-    "x-title": "X-Title",
-    "content-type": "Content-Type",
-}
+TIMEOUT = float(os.getenv("PROXY_TIMEOUT", "120"))
+
+app = FastAPI(title="OpenRouter Proxy")
 
 
 @app.get("/")
+async def root():
+    return {
+        "status": "ok",
+        "service": "openrouter-proxy"
+    }
+
+
+@app.get("/health")
 async def health():
-    return {"status": "ok", "service": "openrouter-proxy"}
+    return {"status": "ok"}
+
+
+def get_headers(request: Request):
+    headers = {}
+
+    if request.headers.get("authorization"):
+        headers["Authorization"] = request.headers["authorization"]
+
+    if request.headers.get("http-referer"):
+        headers["HTTP-Referer"] = request.headers["http-referer"]
+
+    if request.headers.get("x-title"):
+        headers["X-Title"] = request.headers["x-title"]
+
+    if request.headers.get("content-type"):
+        headers["Content-Type"] = request.headers["content-type"]
+
+    if request.headers.get("accept"):
+        headers["Accept"] = request.headers["accept"]
+
+    return headers
+
+
+@app.get("/v1/models")
+async def models(request: Request):
+
+    headers = get_headers(request)
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=TIMEOUT
+        ) as client:
+
+            r = await client.get(
+                f"{OPENROUTER_BASE}/models",
+                headers=headers
+            )
+
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            headers={
+                "Content-Type":
+                    r.headers.get(
+                        "content-type",
+                        "application/json"
+                    )
+            }
+        )
+
+    except httpx.HTTPError as e:
+
+        return Response(
+            content=f'{{"error":"{str(e)}"}}',
+            status_code=502,
+            media_type="application/json"
+        )
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+
     body = await request.body()
-    headers = {"Content-Type": "application/json"}
-    for raw, norm in _FORWARD.items():
-        val = request.headers.get(raw)
-        if val:
-            headers[norm] = val
+
+    headers = get_headers(request)
+
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT) as cx:
-            r = await cx.post(f"{OPENROUTER_BASE}/chat/completions",
-                              content=body, headers=headers)
+        async with httpx.AsyncClient(
+            timeout=TIMEOUT
+        ) as client:
+
+            r = await client.post(
+                f"{OPENROUTER_BASE}/chat/completions",
+                content=body,
+                headers=headers
+            )
+
+        return Response(
+            content=r.content,
+            status_code=r.status_code,
+            headers={
+                "Content-Type":
+                    r.headers.get(
+                        "content-type",
+                        "application/json"
+                    )
+            }
+        )
+
     except httpx.HTTPError as e:
-        return Response(content=f'{{"error":"proxy error: {e}"}}',
-                        status_code=502, media_type="application/json")
-    return Response(content=r.content, status_code=r.status_code,
-                    media_type="application/json")
+
+        return Response(
+            content=f'{{"error":"{str(e)}"}}',
+            status_code=502,
+            media_type="application/json"
+        )
